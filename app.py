@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel, Field
 from yt_dlp import YoutubeDL
-from openai import OpenAI
+from faster_whisper import WhisperModel
 
 APP_DIR = Path(__file__).parent
 JOBS_DIR = Path(os.getenv("JOBS_DIR", str(APP_DIR / "jobs")))
@@ -19,30 +19,59 @@ JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="Clips Adeline Viral AI")
 
+WHISPER_MODEL = None
+CHUNK_SECONDS = 300
+
 
 class CreateRequest(BaseModel):
     url: str
-    formats: list[str] = Field(default_factory=lambda: ["vertical", "horizontal"])
-    max_clips: int = Field(default=5, ge=1, le=15)
-    clip_duration: int = Field(default=60, ge=15, le=90)
+    formats: list[str] = Field(
+        default_factory=lambda: ["vertical"]
+    )
+    max_clips: int = Field(default=3, ge=1, le=15)
+    clip_duration: int = Field(default=30, ge=15, le=90)
 
 
 def run(command):
-    result = subprocess.run(command, capture_output=True, text=True)
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True
+    )
     if result.returncode:
         raise RuntimeError(
-            (result.stderr or result.stdout or "FFmpeg error")[-2500:]
+            (result.stderr or result.stdout or "Error de FFmpeg")[-2000:]
         )
     return result.stdout
+
+
+def get_whisper_model():
+    global WHISPER_MODEL
+
+    if WHISPER_MODEL is None:
+        WHISPER_MODEL = WhisperModel(
+            "tiny",
+            device="cpu",
+            compute_type="int8",
+            cpu_threads=2,
+            num_workers=1,
+            download_root="/tmp/whisper-models"
+        )
+
+    return WHISPER_MODEL
 
 
 def valid_youtube_url(value):
     parsed = urlparse(value)
     host = (parsed.hostname or "").lower()
-    return parsed.scheme == "https" and (
-        host == "youtu.be"
-        or host == "youtube.com"
-        or host.endswith(".youtube.com")
+
+    return (
+        parsed.scheme == "https"
+        and (
+            host == "youtu.be"
+            or host == "youtube.com"
+            or host.endswith(".youtube.com")
+        )
     )
 
 
@@ -51,26 +80,85 @@ def srt_time(seconds):
     hours, ms = divmod(ms, 3600000)
     minutes, ms = divmod(ms, 60000)
     secs, ms = divmod(ms, 1000)
+
     return f"{hours:02}:{minutes:02}:{secs:02},{ms:03}"
 
 
 def score_text(text):
     words = text.lower()
+
     hooks = [
-        "pero", "nunca", "secreto", "increíble", "nadie",
-        "error", "verdad", "por qué", "cómo", "descubrí",
-        "millones", "impactante", "problema", "solución", "imagina"
+        "pero", "nunca", "secreto", "increíble",
+        "nadie", "error", "verdad", "por qué",
+        "cómo", "descubrí", "millones",
+        "impactante", "problema", "solución",
+        "imagina"
     ]
-    score = 42 + sum(5 for hook in hooks if hook in words)
+
+    score = 42 + sum(
+        5 for hook in hooks if hook in words
+    )
+
     score += min(len(text.split()) // 8, 18)
+
     if "?" in text or "!" in text:
         score += 5
+
     return min(95, max(35, score))
+
+
+def transcribe_in_chunks(audio, folder):
+    model = get_whisper_model()
+    chunk_folder = folder / "audio_chunks"
+    chunk_folder.mkdir(exist_ok=True)
+
+    pattern = str(chunk_folder / "chunk-%03d.mp3")
+
+    run([
+        "ffmpeg", "-y",
+        "-i", str(audio),
+        "-f", "segment",
+        "-segment_time", str(CHUNK_SECONDS),
+        "-reset_timestamps", "1",
+        "-c:a", "libmp3lame",
+        "-b:a", "48k",
+        pattern
+    ])
+
+    all_segments = []
+
+    chunks = sorted(chunk_folder.glob("chunk-*.mp3"))
+
+    if not chunks:
+        raise RuntimeError("No se pudieron dividir los audios.")
+
+    for index, chunk in enumerate(chunks):
+        segments, info = model.transcribe(
+            str(chunk),
+            beam_size=1,
+            vad_filter=True
+        )
+
+        offset = index * CHUNK_SECONDS
+
+        for segment in segments:
+            text = segment.text.strip()
+
+            if not text:
+                continue
+
+            all_segments.append({
+                "start": float(segment.start) + offset,
+                "end": float(segment.end) + offset,
+                "text": text
+            })
+
+    return all_segments
 
 
 def build_srt(segments, clip_start, clip_end, target):
     lines = []
-    idx = 1
+    index = 1
 
     for segment in segments:
         start = max(float(segment["start"]), clip_start)
@@ -81,19 +169,26 @@ def build_srt(segments, clip_start, clip_end, target):
             continue
 
         lines.extend([
-            str(idx),
-            f"{srt_time(start - clip_start)} --> {srt_time(end - clip_start)}",
+            str(index),
+            f"{srt_time(start - clip_start)} --> "
+            f"{srt_time(end - clip_start)}",
             text,
             ""
         ])
-        idx += 1
 
-    target.write_text("\n".join(lines), encoding="utf-8")
+        index += 1
+
+    target.write_text(
+        "\n".join(lines),
+        encoding="utf-8"
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return (APP_DIR / "index.html").read_text(encoding="utf-8")
+    return (APP_DIR / "index.html").read_text(
+        encoding="utf-8"
+    )
 
 
 @app.get("/health")
@@ -125,16 +220,7 @@ def create_clips(request: CreateRequest):
     if request.clip_duration not in {15, 30, 45, 60, 90}:
         raise HTTPException(
             400,
-            "Selecciona una duración de clip válida."
-        )
-
-    api_key = os.getenv("OPENAI_API_KEY")
-
-    if not api_key:
-        raise HTTPException(
-            503,
-            "Falta configurar OPENAI_API_KEY en Render. "
-            "La aplicación todavía no puede transcribir videos."
+            "Selecciona una duración válida."
         )
 
     job_id = uuid.uuid4().hex[:12]
@@ -143,33 +229,45 @@ def create_clips(request: CreateRequest):
 
     try:
         options = {
-            "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+            "format": "bestvideo[height<=720]+bestaudio/best[height<=720]",
             "merge_output_format": "mp4",
             "outtmpl": str(folder / "source.%(ext)s"),
             "noplaylist": True,
             "quiet": True,
-            "no_warnings": True,
+            "no_warnings": True
         }
 
         with YoutubeDL(options) as ydl:
-            info = ydl.extract_info(request.url, download=True)
+            info = ydl.extract_info(
+                request.url,
+                download=True
+            )
 
         duration = int(info.get("duration") or 0)
-        max_minutes = int(os.getenv("MAX_VIDEO_MINUTES", "90"))
+        max_minutes = int(
+            os.getenv("MAX_VIDEO_MINUTES", "15")
+        )
 
-        if duration and duration > max_minutes * 60:
+        if not duration:
+            raise RuntimeError(
+                "No se pudo determinar la duración del video."
+            )
+
+        if duration > max_minutes * 60:
             raise ValueError(
                 f"El video supera el límite de {max_minutes} minutos."
             )
 
         source_files = [
             p for p in folder.glob("source.*")
-            if p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}
+            if p.suffix.lower() in {
+                ".mp4", ".mkv", ".webm", ".mov"
+            }
         ]
 
         if not source_files:
             raise RuntimeError(
-                "No se encontró el archivo de video descargado."
+                "No se encontró el video descargado."
             )
 
         source = source_files[0]
@@ -181,28 +279,19 @@ def create_clips(request: CreateRequest):
             "-vn",
             "-ac", "1",
             "-ar", "16000",
-            "-b:a", "64k",
+            "-b:a", "48k",
             str(audio)
         ])
 
-        client = OpenAI(api_key=api_key)
+        segments = transcribe_in_chunks(
+            audio,
+            folder
+        )
 
-        with audio.open("rb") as audio_file:
-            transcript = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                response_format="verbose_json",
-                timestamp_granularities=["segment"],
+        if not segments:
+            raise RuntimeError(
+                "No se detectó voz en el video."
             )
-
-        segments = [
-            {
-                "start": s.start,
-                "end": s.end,
-                "text": s.text
-            }
-            for s in (transcript.segments or [])
-        ]
 
         candidates = []
 
@@ -211,29 +300,24 @@ def create_clips(request: CreateRequest):
             start = float(segment["start"])
             end = float(segment["end"])
 
-            if len(text) >= 35 and 4 <= end - start <= 45:
+            if len(text) >= 20 and end > start:
                 candidates.append({
-                    "start": max(0, start - 1.5),
-                    "end": min(float(duration or end + 1), end + 1.5),
+                    "start": max(0, start - 1),
+                    "end": min(duration, end + 1),
                     "text": text,
-                    "score": score_text(text),
+                    "score": score_text(text)
                 })
 
-        # Ordena los momentos destacados por puntuación.
         candidates.sort(
             key=lambda item: item["score"],
             reverse=True
         )
 
-        # Crea ventanas con la duración seleccionada.
         selected = []
         requested_duration = request.clip_duration
-        video_duration = float(
-            duration or max(
-                (item["end"] for item in candidates),
-                default=0
-            )
-        )
+
+        # Limitamos a 3 clips para cuidar los recursos gratuitos.
+        max_clips = min(request.max_clips, 3)
 
         for candidate in candidates:
             center = (
@@ -241,22 +325,21 @@ def create_clips(request: CreateRequest):
             ) / 2
 
             clip_start = max(
-                0.0,
+                0,
                 center - requested_duration / 2
             )
 
-            clip_end = clip_start + requested_duration
+            clip_end = min(
+                duration,
+                clip_start + requested_duration
+            )
 
-            if video_duration > 0 and clip_end > video_duration:
-                clip_end = video_duration
-                clip_start = max(
-                    0.0,
-                    clip_end - requested_duration
-                )
+            clip_start = max(
+                0,
+                clip_end - requested_duration
+            )
 
-            actual_duration = clip_end - clip_start
-
-            if actual_duration < min(10, requested_duration):
+            if clip_end - clip_start < 10:
                 continue
 
             overlaps = any(
@@ -276,24 +359,21 @@ def create_clips(request: CreateRequest):
                 "end": clip_end
             })
 
-            if len(selected) >= request.max_clips:
+            if len(selected) >= max_clips:
                 break
 
         if not selected:
             raise RuntimeError(
-                "No se encontraron segmentos hablados "
-                "suficientemente largos para proponer clips."
+                "No se encontraron momentos adecuados para crear clips."
             )
 
         output = []
         selected.sort(key=lambda item: item["start"])
 
         for number, candidate in enumerate(selected, 1):
-
             clip_id = f"clip-{number:03d}"
             clip_start = candidate["start"]
             clip_end = candidate["end"]
-            actual_duration = round(clip_end - clip_start)
 
             subtitle = folder / f"{clip_id}.srt"
 
@@ -307,24 +387,23 @@ def create_clips(request: CreateRequest):
             formats = {}
 
             for fmt in request.formats:
-
                 target = folder / f"{clip_id}-{fmt}.mp4"
 
                 if fmt == "vertical":
                     vf = (
-                        "scale=1080:1920:force_original_aspect_ratio=increase,"
-                        "crop=1080:1920,"
+                        "scale=720:1280:force_original_aspect_ratio=increase,"
+                        "crop=720:1280,"
                         f"subtitles={subtitle}:"
                         "force_style='FontName=DejaVu Sans,"
-                        "FontSize=18,Outline=2,Alignment=2,MarginV=110'"
+                        "FontSize=16,Outline=2,Alignment=2,MarginV=70'"
                     )
                 else:
                     vf = (
-                        "scale=1920:1080:force_original_aspect_ratio=decrease,"
-                        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,"
+                        "scale=1280:720:force_original_aspect_ratio=decrease,"
+                        "pad=1280:720:(ow-iw)/2:(oh-ih)/2,"
                         f"subtitles={subtitle}:"
                         "force_style='FontName=DejaVu Sans,"
-                        "FontSize=24,Outline=2,Alignment=2,MarginV=45'"
+                        "FontSize=22,Outline=2,Alignment=2,MarginV=35'"
                     )
 
                 run([
@@ -334,10 +413,10 @@ def create_clips(request: CreateRequest):
                     "-t", str(max(1, clip_end - clip_start)),
                     "-vf", vf,
                     "-c:v", "libx264",
-                    "-preset", "veryfast",
-                    "-crf", "23",
+                    "-preset", "ultrafast",
+                    "-crf", "28",
                     "-c:a", "aac",
-                    "-b:a", "192k",
+                    "-b:a", "96k",
                     "-movflags", "+faststart",
                     str(target)
                 ])
@@ -350,7 +429,7 @@ def create_clips(request: CreateRequest):
                 "number": number,
                 "score": candidate["score"],
                 "text": candidate["text"],
-                "duration": actual_duration,
+                "duration": round(clip_end - clip_start),
                 "formats": formats
             })
 
@@ -361,7 +440,10 @@ def create_clips(request: CreateRequest):
 
         return {
             "job_id": job_id,
-            "title": info.get("title", "Video de YouTube"),
+            "title": info.get(
+                "title",
+                "Video de YouTube"
+            ),
             "clips": output
         }
 
@@ -382,17 +464,19 @@ def download_file(job_id: str, filename: str):
         or "/" in filename
         or "\\" in filename
     ):
-        raise HTTPException(404, "Archivo no encontrado.")
+        raise HTTPException(
+            404,
+            "Archivo no encontrado."
+        )
 
     path = (JOBS_DIR / job_id / filename).resolve()
+    job_folder = (JOBS_DIR / job_id).resolve()
 
-    if (
-        not path.is_file()
-        or not path.is_relative_to(
-            (JOBS_DIR / job_id).resolve()
+    if not path.is_file() or not path.is_relative_to(job_folder):
+        raise HTTPException(
+            404,
+            "Archivo no encontrado."
         )
-    ):
-        raise HTTPException(404, "Archivo no encontrado.")
 
     return FileResponse(
         path,
