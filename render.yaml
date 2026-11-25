@@ -2,16 +2,11 @@ services:
   - type: web
     name: clips-adeline-viral-ai
     runtime: docker
-    plan: starter
+    plan: free
     dockerfilePath: ./Dockerfile
     autoDeploy: true
     healthCheckPath: /health
-    disk:
-      name: clips-adeline-storage
-      mountPath: /app/jobs
-      sizeGB: 10
     envVars:
-      - key: OPENAI_API_KEY
-        sync: false
       - key: MAX_VIDEO_MINUTES
-        value: "90"
+        value: "15"
+        
